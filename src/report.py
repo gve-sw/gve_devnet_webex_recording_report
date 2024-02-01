@@ -21,7 +21,7 @@ import json
 import math
 import os
 import sys
-import threading
+import concurrent.futures
 import time
 from datetime import datetime, timedelta
 
@@ -137,13 +137,16 @@ def get_wrapper(url, token, params):
             # Clear params to avoid 4XX errors
             if next_url:
                 params = {}
-        elif response.status_code == 429 and retry_count < 10:
-            # Handle 429 Too Many Requests error (10 maximum retries to avoid infinite loops)
-            console.print("\n[orange]Rate limit exceeded. Waiting for retry...[/]")
-            retry_count += 1
-            sleep_time = int(
-                response.headers.get('Retry-After', 5))  # Default to 5 seconds if Retry-After is not provided
-            time.sleep(sleep_time)
+        elif response.status_code == 429:
+            # Handle 429 Too Many Requests error (25 maximum retries to avoid infinite loops)
+            if retry_count < 25:
+                retry_count += 1
+                sleep_time = int(
+                    response.headers.get('Retry-After', 10))  # Default to 10 seconds if Retry-After is not provided
+                time.sleep(sleep_time)
+            else:
+                console.print("\n[orange]Rate limit exceeded, maximum amount of retries exceeded.[/]")
+                return None
         else:
             # Print failure message on error
             console.print("\n[red]Request FAILED: [/]" + str(response.status_code))
@@ -222,7 +225,7 @@ def get_recordings_data(token, site_url, progress):
     :param token: Webex OAuth token
     :param site_url: Webex Site URL
     :param progress: Rich Progress Bar (used for display)
-    :return:
+    :return: Sites Recording Processed
     """
     site_recordings_processed = []
     site_recordings_raw = []
@@ -280,38 +283,36 @@ def get_recordings_data(token, site_url, progress):
     # Progress display for recordings
     task = progress.add_task("Process Recordings", total=len(site_recordings_raw_no_duplicates), transient=True)
 
-    threads = []
-    for recording in site_recordings_raw_no_duplicates:
-        # Build recording meta data dictionary
-        recording_info = {"site_url": site_url, "createTime": recording["createTime"], "topic": recording['topic'],
-                          "hostDisplayName": recording['hostDisplayName'], "sizeMegaBytes": '',
-                          "format": recording['format'], "durationMinutes": '',
-                          "serviceType": recording["serviceType"]}
+    max_threads = 10
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_threads) as executor:
+        # Iterate over recordings and submit them to the executor (no more than 10 processed at a time)
+        for recording in site_recordings_raw_no_duplicates:
+            # Build recording meta data dictionary
+            recording_info = {"site_url": site_url, "createTime": recording["createTime"], "topic": recording['topic'],
+                              "hostDisplayName": recording['hostDisplayName'], "sizeMegaBytes": '',
+                              "format": recording['format'], "durationMinutes": '',
+                              "serviceType": recording["serviceType"]}
 
-        # Convert create time to more readable date format
-        parsed_datetime = datetime.fromisoformat(recording_info['createTime'][:-1])
-        recording_info['createTime'] = parsed_datetime.strftime("%m/%d/%y")
+            # Convert create time to more readable date format
+            parsed_datetime = datetime.fromisoformat(recording_info['createTime'][:-1])
+            recording_info['createTime'] = parsed_datetime.strftime("%m/%d/%y")
 
-        # Convert duration in seconds to minutes (easier to read), convert bytes to MB (easier to read)
-        recording_info["durationMinutes"] = round(recording['durationSeconds'] / 60.0)
-        recording_info['sizeMegaBytes'] = round(recording['sizeBytes'] / (1024 ** 2), 2)
+            # Convert duration in seconds to minutes (easier to read), convert bytes to MB (easier to read)
+            recording_info["durationMinutes"] = round(recording['durationSeconds'] / 60.0)
+            recording_info['sizeMegaBytes'] = round(recording['sizeBytes'] / (1024 ** 2), 2)
 
-        # Get site audit report (for last accessed field) - spawn background thread to process 100 recordings at a
-        # time - speeds up large scale workloads
-        thread = threading.Thread(target=get_audit_report,
-                                  args=(token, recording['id'], recording_info, progress, task))
-        threads.append(thread)
+            # Get site audit report (for last accessed field) - submit to executor - speeds up large scale workloads
+            executor.submit(
+                get_audit_report,
+                token,
+                recording['id'],
+                recording_info,
+                progress,
+                task
+            )
 
-        # Append to larger recording details list
-        site_recordings_processed.append(recording_info)
-
-    # Start all threads
-    for t in threads:
-        t.start()
-
-    # Wait for all threads to finish
-    for t in threads:
-        t.join()
+            # Append to larger recording details list
+            site_recordings_processed.append(recording_info)
 
     return site_recordings_processed
 
